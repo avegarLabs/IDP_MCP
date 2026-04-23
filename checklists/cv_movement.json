@@ -1,0 +1,42 @@
+{
+  "framework_name": "CV Movement Disorders Quality Assessment",
+  "description": "Quality checklist for computer vision studies applied to movement disorders in neurodegenerative diseases.",
+  "domains": [
+    {
+      "name": "Population",
+      "questions": [
+        {"id": "P1", "question": "Is the sample size (n) reported?", "guidance": "Look for explicit n= or participant count.", "scoring": "yes/no"},
+        {"id": "P2", "question": "Is the disease described with clear diagnostic criteria?", "guidance": "Check for established criteria (e.g., SARA score for SCA).", "scoring": "yes/no/unclear"},
+        {"id": "P3", "question": "Is a control group included?", "guidance": "Healthy controls or age-matched comparison group.", "scoring": "yes/no"},
+        {"id": "P4", "question": "Are demographics reported (age, sex)?", "guidance": "At minimum mean age and sex distribution.", "scoring": "yes/no"},
+        {"id": "P5", "question": "Is disease severity described (clinical scale)?", "guidance": "SARA, ICARS, UPDRS, or equivalent.", "scoring": "yes/no"}
+      ]
+    },
+    {
+      "name": "Methodology",
+      "questions": [
+        {"id": "M1", "question": "Is the video capture setup described (camera, FPS, resolution)?", "guidance": "Hardware specs and recording conditions.", "scoring": "yes/no"},
+        {"id": "M2", "question": "Is the full CV pipeline described (detection, tracking, features)?", "guidance": "From raw video to final features used for classification.", "scoring": "yes/no/unclear"},
+        {"id": "M3", "question": "Is cross-validation or independent test set used?", "guidance": "k-fold CV, LOSO, or separate test set.", "scoring": "yes/no"},
+        {"id": "M4", "question": "Is comparison with clinical gold standard performed?", "guidance": "Correlation with SARA, UPDRS, or expert rating.", "scoring": "yes/no"},
+        {"id": "M5", "question": "Are statistical tests reported?", "guidance": "p-values, confidence intervals, or effect sizes.", "scoring": "yes/no"}
+      ]
+    },
+    {
+      "name": "Reproducibility",
+      "questions": [
+        {"id": "R1", "question": "Is code publicly available?", "guidance": "GitHub, GitLab, or similar repository.", "scoring": "yes/no"},
+        {"id": "R2", "question": "Are data available or shareable?", "guidance": "Open dataset, data availability statement.", "scoring": "yes/no"},
+        {"id": "R3", "question": "Can results be replicated from the information given?", "guidance": "Sufficient detail for independent replication.", "scoring": "yes/no/unclear"}
+      ]
+    },
+    {
+      "name": "Reporting",
+      "questions": [
+        {"id": "RE1", "question": "Are limitations explicitly discussed?", "guidance": "Dedicated limitations section or paragraph.", "scoring": "yes/no"},
+        {"id": "RE2", "question": "Is conflict of interest declared?", "guidance": "Explicit COI statement.", "scoring": "yes/no"},
+        {"id": "RE3", "question": "Is ethical approval declared?", "guidance": "IRB, ethics committee, or informed consent.", "scoring": "yes/no"}
+      ]
+    }
+  ]
+}

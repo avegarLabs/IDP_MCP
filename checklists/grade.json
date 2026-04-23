@@ -1,0 +1,33 @@
+{
+  "framework_name": "GRADE",
+  "description": "Grading of Recommendations, Assessment, Development and Evaluations. For rating quality of evidence in systematic reviews.",
+  "domains": [
+    {
+      "name": "Risk of Bias",
+      "questions": [
+        {"id": "G1", "question": "Is there low risk of bias in the study design and execution?", "guidance": "Randomization, blinding, adequate follow-up.", "scoring": "low/high/unclear"},
+        {"id": "G2", "question": "Are results consistent across studies?", "guidance": "Similar findings in different populations/settings.", "scoring": "low/high/unclear"}
+      ]
+    },
+    {
+      "name": "Directness",
+      "questions": [
+        {"id": "G3", "question": "Is the evidence directly applicable to the research question?", "guidance": "Population, intervention, and outcomes match.", "scoring": "low/high/unclear"},
+        {"id": "G4", "question": "Are outcome measures directly relevant?", "guidance": "Surrogate vs patient-important outcomes.", "scoring": "low/high/unclear"}
+      ]
+    },
+    {
+      "name": "Precision",
+      "questions": [
+        {"id": "G5", "question": "Are confidence intervals sufficiently narrow?", "guidance": "Adequate sample size, low variability.", "scoring": "low/high/unclear"},
+        {"id": "G6", "question": "Is the effect estimate clinically meaningful?", "guidance": "Effect size crosses minimal important difference.", "scoring": "low/high/unclear"}
+      ]
+    },
+    {
+      "name": "Publication Bias",
+      "questions": [
+        {"id": "G7", "question": "Is there low suspicion of publication bias?", "guidance": "Funnel plot, registry search, or comprehensive search.", "scoring": "low/high/unclear"}
+      ]
+    }
+  ]
+}

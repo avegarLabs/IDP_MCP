@@ -1,0 +1,36 @@
+{
+  "framework_name": "STROBE",
+  "description": "STrengthening the Reporting of OBservational studies in Epidemiology. For observational studies (cohort, case-control, cross-sectional).",
+  "domains": [
+    {
+      "name": "Design and Setting",
+      "questions": [
+        {"id": "S1", "question": "Is the study design clearly stated (cohort, case-control, cross-sectional)?", "guidance": "Study type should be explicit.", "scoring": "yes/no"},
+        {"id": "S2", "question": "Is the setting (location, dates) described?", "guidance": "Where and when the study was conducted.", "scoring": "yes/no"}
+      ]
+    },
+    {
+      "name": "Participants",
+      "questions": [
+        {"id": "S3", "question": "Are eligibility criteria clearly defined?", "guidance": "Inclusion and exclusion criteria.", "scoring": "yes/no"},
+        {"id": "S4", "question": "Is the source population described?", "guidance": "How participants were identified and recruited.", "scoring": "yes/no"},
+        {"id": "S5", "question": "Is participation rate reported?", "guidance": "Number eligible vs enrolled.", "scoring": "yes/no/unclear"}
+      ]
+    },
+    {
+      "name": "Variables and Measurement",
+      "questions": [
+        {"id": "S6", "question": "Are all outcome variables clearly defined?", "guidance": "Primary and secondary outcomes.", "scoring": "yes/no"},
+        {"id": "S7", "question": "Are measurement methods described in sufficient detail?", "guidance": "Instruments, protocols, procedures.", "scoring": "yes/no"},
+        {"id": "S8", "question": "Are potential confounders identified and addressed?", "guidance": "Adjusted analyses or matching.", "scoring": "yes/no/unclear"}
+      ]
+    },
+    {
+      "name": "Bias and Study Size",
+      "questions": [
+        {"id": "S9", "question": "Are efforts to address potential sources of bias described?", "guidance": "Selection, information, or confounding bias.", "scoring": "yes/no"},
+        {"id": "S10", "question": "Is the study size justified?", "guidance": "Power calculation or sample size rationale.", "scoring": "yes/no/unclear"}
+      ]
+    }
+  ]
+}

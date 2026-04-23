@@ -1,0 +1,40 @@
+[project]
+name = "paper-analyzer-mcp"
+version = "2.0.0"
+description = "MCP server for systematic review of research papers (PDF). 13 tools + 3 prompts covering the full PRISMA pipeline via FastMCP + pdfplumber."
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [
+    { name = "Alfredo" },
+]
+dependencies = [
+    "fastmcp>=2.0,<4.0",
+    "pdfplumber>=0.11",
+    "python-docx>=1.2.0",
+]
+
+[project.optional-dependencies]
+fallback = [
+    "pymupdf4llm>=0.0.10",
+]
+export = [
+    "python-docx>=1.1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "reportlab>=4.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+asyncio_mode = "auto"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
+
+[tool.uv]
+package = false

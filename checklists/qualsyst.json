@@ -1,0 +1,34 @@
+{
+  "framework_name": "QualSyst",
+  "description": "Standard Quality Assessment Criteria for quantitative and qualitative studies. Scoring: 2=yes, 1=partial, 0=no.",
+  "domains": [
+    {
+      "name": "Research Question",
+      "questions": [
+        {"id": "Q1", "question": "Is the research question or objective clearly stated?", "guidance": "Explicit hypothesis or aim.", "scoring": "0/1/2"},
+        {"id": "Q2", "question": "Is the study design appropriate for the question?", "guidance": "Design matches the research objective.", "scoring": "0/1/2"}
+      ]
+    },
+    {
+      "name": "Sampling",
+      "questions": [
+        {"id": "Q3", "question": "Is the sampling strategy appropriate?", "guidance": "Representative sample, adequate recruitment.", "scoring": "0/1/2"},
+        {"id": "Q4", "question": "Is the sample size adequate?", "guidance": "Power calculation or justified sample.", "scoring": "0/1/2"}
+      ]
+    },
+    {
+      "name": "Measurement",
+      "questions": [
+        {"id": "Q5", "question": "Are outcome measures well defined and robust?", "guidance": "Validated instruments, clear definitions.", "scoring": "0/1/2"},
+        {"id": "Q6", "question": "Is the analytic method appropriate?", "guidance": "Statistical methods match data type and question.", "scoring": "0/1/2"}
+      ]
+    },
+    {
+      "name": "Results and Conclusions",
+      "questions": [
+        {"id": "Q7", "question": "Are results reported in sufficient detail?", "guidance": "Effect sizes, confidence intervals, p-values.", "scoring": "0/1/2"},
+        {"id": "Q8", "question": "Are conclusions supported by the results?", "guidance": "No over-interpretation or unsupported claims.", "scoring": "0/1/2"}
+      ]
+    }
+  ]
+}
