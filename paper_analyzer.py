@@ -1,15 +1,16 @@
 """paper-analyzer-mcp v2.0 — FastMCP entrypoint.
 
-Exposes 16 MCP tools and 4 prompts covering the full PRISMA systematic
+Exposes 18 MCP tools and 4 prompts covering the full PRISMA systematic
 review pipeline over STDIO transport:
 
-  Fase 1: list_papers, get_paper_metadata
+  Fase 1: list_papers, get_paper_metadata, get_ocr_status
   Fase 2: screen_paper, search_keywords
   Fase 3: extract_sections, extract_study_data, extract_references
   Fase 4: assess_quality, get_quality_checklist
   Fase 5: compare_papers, synthesis_matrix
   Fase 6: keyword_cooccurrence, coverage_matrix
-  Fase 7: export_analysis, export_review, export_comparison
+  Fase 7: export_analysis, export_review, export_comparison,
+          export_coverage_matrix
 
 The server never logs to stdout — that channel is reserved for JSON-RPC 2.0
 traffic when running under the STDIO transport. Every log message and warning
@@ -18,16 +19,20 @@ is routed to stderr instead.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
+import re
 import sys
+import threading
 import warnings
 from pathlib import Path
 from typing import Any
 
 from fastmcp import FastMCP
 
+from config import get_ocr_config
 from models.domain_patterns import KEYWORD_VARIANTS
 from services.bibliometric_engine import keyword_cooccurrence as _kw_cooccurrence
 from services.cross_paper_analyzer import (
@@ -38,9 +43,12 @@ from services.keyword_searcher import count_occurrences, search_in_text
 from services.metadata_extractor import extract_metadata
 from services.path_utils import UnsafePathError, safe_resolve
 from services.paper_scanner import list_pdfs
+from services.ocr_extractor import OcrOptions, ocr_status
 from services.pdf_extractor import (
+    PageText,
     PdfExtractionError,
     extract_full_text,
+    extract_pdf_metadata,
     has_extractable_text,
 )
 from services.quality_assessor import (
@@ -65,6 +73,8 @@ from services.document_exporter import (
     export_review_docx,
     export_comparison_md,
     export_comparison_docx,
+    export_coverage_matrix_md,
+    export_coverage_matrix_docx,
 )
 
 # Allowed ``sections`` argument values surfaced to MCP callers in error
@@ -78,6 +88,16 @@ _ALLOWED_SECTION_ARGS: list[str] = list(VALID_SECTION_NAMES) + [
 # Logging — stderr only, never stdout (STDIO transport is JSON-RPC on stdout).
 # ---------------------------------------------------------------------------
 
+# MCP is defined over UTF-8. On Windows the inherited console encoding can be
+# cp1252, which makes logging a Spanish/Portuguese filename raise
+# ``UnicodeEncodeError`` and can corrupt JSON-RPC frames. Force UTF-8 on both
+# streams when the host provides real streams (PyInstaller onefile may not).
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+    except (AttributeError, ValueError, OSError):
+        pass
+
 logging.basicConfig(
     stream=sys.stderr,
     level=os.environ.get("PAPER_ANALYZER_LOG_LEVEL", "INFO").upper(),
@@ -86,6 +106,46 @@ logging.basicConfig(
 logging.captureWarnings(True)
 warnings.filterwarnings("default")  # ensure warnings go through logging
 logger = logging.getLogger("paper-analyzer")
+
+
+# ---------------------------------------------------------------------------
+# Race-condition guard for slow tool calls under STDIO transport.
+# ---------------------------------------------------------------------------
+# When a client (e.g. LM Studio) cancels a long-running request, the MCP
+# framework calls ``responder.cancel()`` which sets ``_completed = True`` and
+# emits an error response. If our synchronous tool then finishes and the
+# framework reaches ``await message.respond(...)`` it trips the
+# ``assert not self._completed`` in mcp.shared.session, the AssertionError
+# escapes the per-request task, the TaskGroup raises ExceptionGroup, and the
+# whole server process dies. We make ``respond`` idempotent so a duplicate
+# response is silently dropped instead of crashing the server.
+def _patch_request_responder_respond() -> None:
+    try:
+        from mcp.shared.session import RequestResponder
+    except ImportError:
+        return
+
+    original_respond = RequestResponder.respond
+
+    async def safe_respond(self, response):  # type: ignore[no-untyped-def]
+        if getattr(self, "_completed", False) or getattr(self, "cancelled", False):
+            logger.debug(
+                "Skipping duplicate respond() for request %r (already completed)",
+                getattr(self, "request_id", "?"),
+            )
+            return
+        try:
+            await original_respond(self, response)
+        except AssertionError:
+            logger.debug(
+                "Suppressed 'Request already responded to' for request %r",
+                getattr(self, "request_id", "?"),
+            )
+
+    RequestResponder.respond = safe_respond  # type: ignore[assignment]
+
+
+_patch_request_responder_respond()
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +162,19 @@ _SECTION_TEXT_CHAR_LIMIT = 3000
 
 # Hard cap on snippets returned per (keyword, section) pair in search_keywords.
 _SNIPPET_CAP_PER_PAIR = 10
+
+# OCR settings are read when this module is (re)loaded so that tests and hosts
+# can select them through the environment. ``ocr_status`` still reads the model
+# state at call time, so a model installed later is picked up without a restart.
+_OCR_CONFIG = get_ocr_config()
+_OCR_OPTIONS = OcrOptions(
+    lang=str(_OCR_CONFIG["lang"]),
+    dpi=int(_OCR_CONFIG["dpi"]),
+    min_chars=int(_OCR_CONFIG["min_chars"]),
+    max_pages=int(_OCR_CONFIG["max_pages"]),
+    text_score=float(_OCR_CONFIG["text_score"]),
+)
+OCR_ENABLED: bool = bool(_OCR_CONFIG["enabled"])
 
 
 # ---------------------------------------------------------------------------
@@ -124,7 +197,8 @@ mcp = FastMCP(
         "7. compare_papers → cross-paper comparison table\n"
         "8. synthesis_matrix → evidence/coverage/gap matrices\n"
         "9. keyword_cooccurrence / coverage_matrix → bibliometric analysis\n"
-        "10. export_analysis / export_review / export_comparison → generate documents\n\n"
+        "10. export_analysis / export_review / export_comparison / "
+        "export_coverage_matrix → generate documents\n\n"
         "Each tool returns structured JSON. The LLM reasons over the data.\n"
         "Use the 'analyze_and_export' prompt for guided analysis + export workflow."
     ),
@@ -200,12 +274,22 @@ def _validate_sections_arg(sections: list[str]) -> list[str] | str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def list_papers() -> str:
-    """List every PDF available in the configured papers directory with enriched metadata.
+def list_papers(enrich: bool = False) -> str:
+    """List every PDF available in the configured papers directory.
 
-    Returns JSON: either an ``error``/``message`` envelope, or a list of
-    ``{filename, size_kb, page_count, detected_title, has_abstract,
-    estimated_word_count, detected_language}`` entries.
+    By default returns a fast inventory (filename, size_kb, page_count). Set
+    ``enrich=True`` to also extract title/abstract/word-count/language per
+    paper — this reads the full text of every PDF and can take seconds per
+    file, so call it only when the extra metadata is needed (e.g. when the
+    LLM has to choose papers by title rather than filename).
+
+    Args:
+        enrich: When True, augment each entry with ``detected_title``,
+            ``has_abstract``, ``estimated_word_count``, ``detected_language``.
+
+    Returns:
+        JSON: either an ``error``/``message`` envelope, or a list of paper
+        entries (enriched fields included only when ``enrich=True``).
     """
     if not PAPERS_DIR.exists():
         return _error(
@@ -217,23 +301,28 @@ def list_papers() -> str:
     if not papers:
         return _json({"message": "No PDFs found", "dir": str(PAPERS_DIR)})
 
-    enriched = []
+    entries = []
     for p in papers:
         entry = p.to_dict()
-        if p.page_count > 0:
+        if enrich and p.page_count > 0:
             try:
                 pdf_path = PAPERS_DIR / p.filename
-                pages = extract_full_text(pdf_path)
-                if has_extractable_text(pages):
-                    meta = extract_metadata(pages, p.filename)
+                pages = _load_pages(p.filename)
+                if not isinstance(pages, str) and has_extractable_text(pages):
+                    pdf_meta = extract_pdf_metadata(pdf_path)
+                    meta = extract_metadata(pages, p.filename, pdf_meta=pdf_meta)
                     entry["detected_title"] = meta["title"]
                     entry["has_abstract"] = "abstract" in meta["detected_sections"]
                     entry["estimated_word_count"] = meta["estimated_word_count"]
                     entry["detected_language"] = meta["detected_language"]
+                    entry["ocr_used"] = any(page.get("ocr") for page in pages)
+                    entry["ocr_pages"] = [
+                        page["page_number"] for page in pages if page.get("ocr")
+                    ]
             except Exception:
                 logger.debug("Could not enrich metadata for %s", p.filename)
-        enriched.append(entry)
-    return _json(enriched)
+        entries.append(entry)
+    return _json(entries)
 
 
 @mcp.tool()
@@ -252,22 +341,18 @@ def get_paper_metadata(filename: str) -> str:
     if isinstance(resolved, str):
         return resolved
 
-    try:
-        pages = extract_full_text(resolved)
-    except PermissionError:
-        return _error(f"Permission denied: {filename}")
-    except PdfExtractionError as exc:
-        return _error(str(exc))
+    pages = _load_pages(filename)
+    if isinstance(pages, str):
+        return pages
 
     if not has_extractable_text(pages):
-        return _json({
-            "warning": "No text extracted. The PDF may be scanned or image-based.",
-            "filename": filename,
-            "total_pages": len(pages),
-        })
+        return _no_text_payload(filename, len(pages), total_pages=len(pages))
 
-    meta = extract_metadata(pages, filename)
+    pdf_meta = extract_pdf_metadata(resolved)
+    meta = extract_metadata(pages, filename, pdf_meta=pdf_meta)
     meta["filename"] = filename
+    meta["ocr_used"] = any(page.get("ocr") for page in pages)
+    meta["ocr_pages"] = [page["page_number"] for page in pages if page.get("ocr")]
     return _json(meta)
 
 
@@ -287,18 +372,12 @@ def extract_references(filename: str, max_refs: int = 50) -> str:
     if isinstance(resolved, str):
         return resolved
 
-    try:
-        pages = extract_full_text(resolved)
-    except PermissionError:
-        return _error(f"Permission denied: {filename}")
-    except PdfExtractionError as exc:
-        return _error(str(exc))
+    pages = _load_pages(filename)
+    if isinstance(pages, str):
+        return pages
 
     if not has_extractable_text(pages):
-        return _json({
-            "warning": "No text extracted. The PDF may be scanned or image-based.",
-            "filename": filename,
-        })
+        return _no_text_payload(filename, len(pages))
 
     detected = detect_sections(pages)
     ref_text = detected.get("references", "")
@@ -346,12 +425,9 @@ def screen_paper(
     if isinstance(resolved, str):
         return resolved
 
-    try:
-        pages = extract_full_text(resolved)
-    except PermissionError:
-        return _error(f"Permission denied: {filename}")
-    except PdfExtractionError as exc:
-        return _error(str(exc))
+    pages = _load_pages(filename)
+    if isinstance(pages, str):
+        return pages
 
     if not has_extractable_text(pages):
         return _json({
@@ -359,6 +435,7 @@ def screen_paper(
             "screening_summary": {"criteria_met_count": 0, "criteria_total": len(criteria_keywords),
                                   "has_exclusions": False, "all_sections_present": False},
             "note": "No text extracted.",
+            "ocr": _ocr_info(),
         })
 
     detected = detect_sections(pages)
@@ -439,15 +516,12 @@ def extract_study_data(filename: str, domain: str = "cv_movement") -> str:
     if isinstance(resolved, str):
         return resolved
 
-    try:
-        pages = extract_full_text(resolved)
-    except PermissionError:
-        return _error(f"Permission denied: {filename}")
-    except PdfExtractionError as exc:
-        return _error(str(exc))
+    pages = _load_pages(filename)
+    if isinstance(pages, str):
+        return pages
 
     if not has_extractable_text(pages):
-        return _json({"warning": "No text extracted.", "filename": filename})
+        return _no_text_payload(filename, len(pages))
 
     sections = detect_sections(pages)
     data = _extract_study_data(sections, domain=domain)
@@ -485,21 +559,12 @@ def extract_sections(
     if isinstance(resolved, str):
         return resolved
 
-    try:
-        pages = extract_full_text(resolved)
-    except PermissionError:
-        return _error(f"Permission denied: {filename}")
-    except PdfExtractionError as exc:
-        return _error(str(exc))
+    pages = _load_pages(filename)
+    if isinstance(pages, str):
+        return pages
 
     if not has_extractable_text(pages):
-        return _json(
-            {
-                "warning": "No text extracted. The PDF may be scanned or image-based.",
-                "filename": filename,
-                "page_count": len(pages),
-            }
-        )
+        return _no_text_payload(filename, len(pages))
 
     detected = detect_sections(pages)
     filter_set = set(validated)
@@ -555,21 +620,12 @@ def search_keywords(
     if isinstance(resolved, str):
         return resolved
 
-    try:
-        pages = extract_full_text(resolved)
-    except PermissionError:
-        return _error(f"Permission denied: {filename}")
-    except PdfExtractionError as exc:
-        return _error(str(exc))
+    pages = _load_pages(filename)
+    if isinstance(pages, str):
+        return pages
 
     if not has_extractable_text(pages):
-        return _json(
-            {
-                "warning": "No text extracted. The PDF may be scanned or image-based.",
-                "filename": filename,
-                "page_count": len(pages),
-            }
-        )
+        return _no_text_payload(filename, len(pages))
 
     detected = detect_sections(pages)
     filter_set = set(validated_sections)
@@ -632,15 +688,12 @@ def assess_quality(filename: str) -> str:
     if isinstance(resolved, str):
         return resolved
 
-    try:
-        pages = extract_full_text(resolved)
-    except PermissionError:
-        return _error(f"Permission denied: {filename}")
-    except PdfExtractionError as exc:
-        return _error(str(exc))
+    pages = _load_pages(filename)
+    if isinstance(pages, str):
+        return pages
 
     if not has_extractable_text(pages):
-        return _json({"warning": "No text extracted.", "filename": filename})
+        return _no_text_payload(filename, len(pages))
 
     sections = detect_sections(pages)
     result = _assess_quality(sections)
@@ -654,12 +707,15 @@ def get_quality_checklist(framework: str = "cv_movement") -> str:
 
     Args:
         framework: One of "cv_movement", "quadas2", "grade", "strobe",
-            "qualsyst". Use list to see available frameworks.
+            "qualsyst". Pass "list" to get the available framework names.
 
     Returns:
         JSON checklist with domains and scoring questions, or an error
         with available framework names.
     """
+    if (framework or "").strip().lower() == "list":
+        return _json({"available_frameworks": list_available_frameworks()})
+
     checklist = load_checklist(framework)
     if checklist is None:
         available = list_available_frameworks()
@@ -670,16 +726,312 @@ def get_quality_checklist(framework: str = "cv_movement") -> str:
     return _json(checklist)
 
 
+@mcp.tool()
+def get_ocr_status() -> str:
+    """Report whether OCR is available for scanned/image-only PDFs.
+
+    Call this before analyzing a scanned paper. When ``available`` is true,
+    every tool that reads a PDF automatically falls back to OCR on pages with
+    no text layer; results are cached in ``PAPERS_DIR/.paper_cache``.
+
+    Returns:
+        JSON with ``enabled``, ``available``, ``engine``, ``backend``,
+        ``version``, ``languages``, the resolved ``model_path``, the active
+        ``settings`` and any actionable ``error``.
+    """
+    status = ocr_status()
+    status["enabled"] = OCR_ENABLED
+    status["settings"] = {
+        "lang": _OCR_OPTIONS.lang,
+        "dpi": _OCR_OPTIONS.dpi,
+        "min_chars": _OCR_OPTIONS.min_chars,
+        "max_pages": _OCR_OPTIONS.max_pages,
+        "text_score": _OCR_OPTIONS.text_score,
+    }
+    try:
+        status["cache_dir"] = str(_cache_dir())
+    except OSError:
+        status["cache_dir"] = None
+    return _json(status)
+
+
 # ---------------------------------------------------------------------------
 # Fase 5 — Cross-Paper Synthesis
 # ---------------------------------------------------------------------------
 
 
-def _load_paper_data(filename: str) -> dict | str:
-    """Internal: load a paper's study data for cross-paper analysis."""
+# Two-level cache for cross-paper analysis:
+#   1. In-memory dict (fastest, scoped to the current MCP session).
+#   2. JSON files under ``PAPERS_DIR/.paper_cache/`` (persists between
+#      sessions, written incrementally so that a client timeout — common in
+#      LM Studio — does not lose progress).
+# Both are keyed by ``(filename, mtime_ns, ocr_signature)`` so any PDF edit or
+# OCR setting/model change invalidates its own entry automatically.
+_paper_data_cache: dict[tuple[str, int, str], dict] = {}
+
+# In-memory cache of lower-cased full text per paper, keyed by ``(filename,
+# mtime_ns, ocr_signature)``. Used by ``keyword_cooccurrence`` (and other tools
+# that scan the raw text) so the second call inside one MCP session is
+# instantaneous. Memory-only on purpose: full text would bloat the disk cache.
+_paper_text_cache: dict[tuple[str, int, str], str] = {}
+
+# Page-level cache used by every single-paper tool. OCR is expensive, so a
+# scanned PDF must only be OCRed once per mtime/settings combination, even when
+# the LLM calls extract_sections, search_keywords and assess_quality in a row.
+_pages_cache: dict[tuple[str, int, str], list[PageText]] = {}
+
+
+def _cache_dir() -> Path:
+    d = PAPERS_DIR / ".paper_cache"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _cache_path(filename: str) -> Path:
+    """Flatten a paper name into a cache filename safe on every filesystem.
+
+    ``_resolve_pdf`` accepts names in subdirectories (``sub/paper.pdf``), so
+    using the raw name would build a non-existent nested cache path and silently
+    disable the disk cache. A short hash keeps distinct non-ASCII names (which
+    collapse to the same ASCII stem) from colliding.
+    """
+    flat = re.sub(r"[^A-Za-z0-9._-]+", "_", filename.replace("\\", "/")).strip("._")
+    flat = (flat or "paper")[:80]
+    digest = hashlib.sha256(filename.encode("utf-8")).hexdigest()[:8]
+    return _cache_dir() / f"{flat}_{digest}.json"
+
+
+def _pages_cache_path(filename: str) -> Path:
+    """Cache path for extracted page text (including OCR output)."""
+    return _cache_path(filename).with_suffix(".pages.json")
+
+
+def _ocr_signature() -> str:
+    """Fingerprint the OCR settings and model so caches cannot go stale."""
+    status = ocr_status()
+    parts = [
+        "v1",
+        str(int(OCR_ENABLED)),
+        str(_OCR_OPTIONS.lang),
+        str(_OCR_OPTIONS.dpi),
+        str(_OCR_OPTIONS.min_chars),
+        str(_OCR_OPTIONS.max_pages),
+        str(_OCR_OPTIONS.text_score),
+        str(status.get("model_path") or ""),
+        str(status.get("model_mtime_ns") or ""),
+    ]
+    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:16]
+
+
+def _read_pages_cache(
+    filename: str, mtime_ns: int, signature: str
+) -> list[PageText] | None:
+    try:
+        cache_path = _pages_cache_path(filename)
+    except OSError:
+        # Read-only media or an unwritable PAPERS_DIR: cache is best-effort.
+        return None
+    if not cache_path.is_file():
+        return None
+    try:
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if payload.get("mtime_ns") != mtime_ns or payload.get("signature") != signature:
+        return None
+    raw_pages = payload.get("pages")
+    if not isinstance(raw_pages, list):
+        return None
+    pages: list[PageText] = []
+    for raw in raw_pages:
+        if (
+            isinstance(raw, dict)
+            and isinstance(raw.get("page_number"), int)
+            and isinstance(raw.get("text"), str)
+        ):
+            pages.append(raw)
+    return pages
+
+
+def _write_pages_cache(
+    filename: str, mtime_ns: int, signature: str, pages: list[PageText]
+) -> None:
+    try:
+        cache_path = _pages_cache_path(filename)
+    except OSError as exc:
+        logger.debug("Page cache unavailable for %s: %s", filename, exc)
+        return
+    tmp_path = (
+        cache_path.parent
+        / f"{cache_path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    try:
+        tmp_path.write_text(
+            json.dumps(
+                {
+                    "mtime_ns": mtime_ns,
+                    "signature": signature,
+                    "pages": pages,
+                },
+                ensure_ascii=False,
+                default=str,
+            ),
+            encoding="utf-8",
+        )
+        os.replace(tmp_path, cache_path)
+    except OSError as exc:
+        logger.warning("Could not write page cache for %s: %s", filename, exc)
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _ocr_info() -> dict[str, Any]:
+    """Return the OCR state plus an actionable hint for no-text responses."""
+    status = ocr_status()
+    available = bool(status.get("available"))
+    info: dict[str, Any] = {"enabled": OCR_ENABLED, "available": available}
+    if not OCR_ENABLED:
+        info["hint"] = (
+            "OCR is disabled. Set OCR_ENABLED=1 and restart the server to read "
+            "scanned PDFs."
+        )
+    elif not available:
+        info["hint"] = status.get("error") or "OCR is enabled but unavailable."
+    else:
+        info["hint"] = (
+            "OCR ran but found no readable text. The scan may be blank, rotated, "
+            "or too low-resolution."
+        )
+    return info
+
+
+def _no_text_payload(filename: str, page_count: int, **extra: Any) -> str:
+    """Uniform no-text envelope with OCR status, used by every reader tool."""
+    info = _ocr_info()
+    payload: dict[str, Any] = {
+        "warning": "No text extracted. The PDF may be scanned or image-based.",
+        "filename": filename,
+        "page_count": page_count,
+    }
+    payload.update(extra)
+    payload["ocr"] = info
+    payload["hint"] = info["hint"]
+    return _json(payload)
+
+
+def _load_pages(filename: str) -> list[PageText] | str:
+    """Load page text, using the cached OCR result when available.
+
+    This is the single extraction entry point for every tool. It resolves the
+    filename, applies the configured OCR fallback, and memoises the result both
+    in memory and under ``PAPERS_DIR/.paper_cache``.
+    """
     resolved = _resolve_pdf(filename)
     if isinstance(resolved, str):
         return resolved
+
+    mtime_ns = resolved.stat().st_mtime_ns
+    signature = _ocr_signature()
+    cache_key = (filename, mtime_ns, signature)
+
+    cached = _pages_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    disk_cached = _read_pages_cache(filename, mtime_ns, signature)
+    if disk_cached is not None:
+        _pages_cache[cache_key] = disk_cached
+        return disk_cached
+
+    try:
+        pages = extract_full_text(
+            resolved,
+            ocr=OCR_ENABLED,
+            ocr_options=_OCR_OPTIONS,
+        )
+    except PermissionError:
+        return _error(f"Permission denied: {filename}")
+    except PdfExtractionError as exc:
+        return _error(str(exc))
+
+    _pages_cache[cache_key] = pages
+    _write_pages_cache(filename, mtime_ns, signature, pages)
+    return pages
+
+
+def _read_disk_cache(
+    filename: str, mtime_ns: int, signature: str | None = None
+) -> dict | None:
+    try:
+        cache_path = _cache_path(filename)
+    except OSError:
+        # Read-only media or an unwritable PAPERS_DIR: cache is best-effort.
+        return None
+    if not cache_path.is_file():
+        return None
+    try:
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if payload.get("mtime_ns") != mtime_ns:
+        return None
+    if signature is not None and payload.get("signature") != signature:
+        return None
+    data = payload.get("data")
+    return data if isinstance(data, dict) else None
+
+
+def _write_disk_cache(
+    filename: str, mtime_ns: int, data: dict, signature: str | None = None
+) -> None:
+    try:
+        cache_path = _cache_path(filename)
+    except OSError as exc:
+        logger.debug("Disk cache unavailable for %s: %s", filename, exc)
+        return
+    tmp_path = (
+        cache_path.parent
+        / f"{cache_path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    try:
+        tmp_path.write_text(
+            json.dumps({"mtime_ns": mtime_ns, "data": data}, ensure_ascii=False, default=str),
+            encoding="utf-8",
+        )
+        os.replace(tmp_path, cache_path)
+    except OSError as exc:
+        logger.warning("Could not write disk cache for %s: %s", filename, exc)
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _load_paper_data(filename: str) -> dict | str:
+    """Internal: load a paper's study data for cross-paper analysis.
+
+    Two-level cache (memory + disk) keyed by ``(filename, mtime)``. The disk
+    cache lets a long-running cross-paper analysis resume after a client
+    timeout — partially processed papers stay cached and the next call only
+    has to parse the remainder.
+    """
+    resolved = _resolve_pdf(filename)
+    if isinstance(resolved, str):
+        return resolved
+
+    mtime_ns = resolved.stat().st_mtime_ns
+    cache_key = (filename, mtime_ns)
+
+    cached = _paper_data_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    disk_cached = _read_disk_cache(filename, mtime_ns)
+    if disk_cached is not None:
+        _paper_data_cache[cache_key] = disk_cached
+        return disk_cached
 
     try:
         pages = extract_full_text(resolved)
@@ -687,19 +1039,81 @@ def _load_paper_data(filename: str) -> dict | str:
         return _error(f"Cannot read: {filename}")
 
     if not has_extractable_text(pages):
-        return {"filename": filename, "study_data": {}, "title": "Unknown", "year": None}
+        result = {"filename": filename, "study_data": {}, "title": "Unknown", "year": None}
+        _paper_data_cache[cache_key] = result
+        _write_disk_cache(filename, mtime_ns, result)
+        return result
 
     sections = detect_sections(pages)
-    meta = extract_metadata(pages, filename)
+    pdf_meta = extract_pdf_metadata(resolved)
+    meta = extract_metadata(pages, filename, pdf_meta=pdf_meta)
     study = _extract_study_data(sections)
 
-    return {
+    result = {
         "filename": filename,
         "title": meta.get("title", "Unknown"),
         "year": meta.get("year"),
         "metadata": meta,
         "study_data": study,
     }
+    _paper_data_cache[cache_key] = result
+    _write_disk_cache(filename, mtime_ns, result)
+    return result
+
+
+def _collect_papers_data(
+    filenames: list[str],
+) -> tuple[list[dict], list[dict[str, str]]]:
+    """Resolve and load paper data, splitting successes from failures.
+
+    Returns ``(loaded, skipped)`` where ``skipped`` carries ``{"filename",
+    "reason"}`` entries. Callers should surface ``skipped`` to the client
+    instead of aborting on the first bad filename — a single hallucinated
+    or stale name should not invalidate a 20-paper synthesis.
+    """
+    loaded: list[dict] = []
+    skipped: list[dict[str, str]] = []
+    for fname in filenames:
+        data = _load_paper_data(fname)
+        if isinstance(data, str):
+            try:
+                reason = json.loads(data).get("error", "load_failed")
+            except (ValueError, TypeError):
+                reason = "load_failed"
+            skipped.append({"filename": fname, "reason": str(reason)})
+            continue
+        loaded.append(data)
+    return loaded, skipped
+
+
+def _get_paper_text_lower(filename: str) -> tuple[str | None, str]:
+    """Return ``(lower_cased_full_text, "")`` or ``(None, reason)``.
+
+    Memoised in :data:`_paper_text_cache` so callers that scan the same paper
+    repeatedly (e.g. ``keyword_cooccurrence`` re-invoked with different
+    keyword sets) only pay the pdfplumber cost once per session.
+    """
+    resolved = _resolve_pdf(filename)
+    if isinstance(resolved, str):
+        return None, "unresolved"
+
+    mtime_ns = resolved.stat().st_mtime_ns
+    cache_key = (filename, mtime_ns)
+    cached = _paper_text_cache.get(cache_key)
+    if cached is not None:
+        return cached, ""
+
+    try:
+        pages = extract_full_text(resolved)
+    except (PermissionError, PdfExtractionError):
+        return None, "extraction_failed"
+
+    if not has_extractable_text(pages):
+        return None, "no_text"
+
+    text = " ".join(p.get("text", "") for p in pages).lower()
+    _paper_text_cache[cache_key] = text
+    return text, ""
 
 
 @mcp.tool()
@@ -726,14 +1140,16 @@ def compare_papers(
             "disease", "cv_tool", "ml_model", "motor_task", "metrics", "sample_size",
         ]
 
-    papers_data: list[dict] = []
-    for fname in filenames:
-        data = _load_paper_data(fname)
-        if isinstance(data, str):
-            return data  # propagate error
-        papers_data.append(data)
+    papers_data, skipped = _collect_papers_data(filenames)
+    if len(papers_data) < 2:
+        return _error(
+            "Need at least 2 readable papers; "
+            f"got {len(papers_data)} after skipping invalid filenames.",
+            skipped_papers=skipped,
+        )
 
     result = _compare_papers(papers_data, comparison_fields)
+    result["skipped_papers"] = skipped
     return _json(result)
 
 
@@ -764,14 +1180,12 @@ def synthesis_matrix(
             allowed=["evidence", "coverage", "gap"],
         )
 
-    papers_data: list[dict] = []
-    for fname in filenames:
-        data = _load_paper_data(fname)
-        if isinstance(data, str):
-            return data
-        papers_data.append(data)
+    papers_data, skipped = _collect_papers_data(filenames)
+    if not papers_data:
+        return _error("No readable papers found.", skipped_papers=skipped)
 
     result = _build_synthesis_matrix(papers_data, matrix_type, axis_x, axis_y)
+    result["skipped_papers"] = skipped
     return _json(result)
 
 
@@ -800,29 +1214,42 @@ def keyword_cooccurrence(
     if not keywords:
         return _error("`keywords` must be a non-empty list.")
 
-    # Build keyword presence map per paper
+    # Precompile one regex per keyword. Word-boundary match avoids 'ML' inside
+    # 'STIMULATION' or 'home' inside 'homeostasis'. ``None`` slots preserve the
+    # caller's keyword positions so the motor still produces a matrix sized to
+    # the original ``keywords`` list (empty keywords yield empty rows/cols).
+    compiled: list[tuple[str, re.Pattern[str]] | None] = []
+    for kw in keywords:
+        kw_clean = (kw or "").strip()
+        if not kw_clean:
+            compiled.append(None)
+            continue
+        compiled.append(
+            (kw_clean, re.compile(rf"\b{re.escape(kw_clean.lower())}\b"))
+        )
+
     papers_keywords: dict[str, list[str]] = {}
-    for fname in filenames:
-        resolved = _resolve_pdf(fname)
-        if isinstance(resolved, str):
+    skipped: list[dict[str, str]] = []
+    total = len(filenames)
+    for idx, fname in enumerate(filenames, start=1):
+        logger.info("keyword_cooccurrence: %d/%d %s", idx, total, fname)
+        text, reason = _get_paper_text_lower(fname)
+        if text is None:
+            skipped.append({"filename": fname, "reason": reason})
             continue
 
-        try:
-            pages = extract_full_text(resolved)
-        except (PermissionError, PdfExtractionError):
-            continue
-
-        if not has_extractable_text(pages):
-            continue
-
-        all_text = " ".join(p.get("text", "") for p in pages).lower()
         found: list[str] = []
-        for kw in keywords:
-            if kw.lower() in all_text:
+        for entry in compiled:
+            if entry is None:
+                continue
+            kw, pat = entry
+            if pat.search(text):
                 found.append(kw)
         papers_keywords[fname] = found
 
     result = _kw_cooccurrence(papers_keywords, keywords)
+    result["analyzed_count"] = len(papers_keywords)
+    result["skipped_papers"] = skipped
     return _json(result)
 
 
@@ -846,18 +1273,15 @@ def coverage_matrix(
     if not filenames:
         return _error("`filenames` must be a non-empty list.")
 
-    papers_data: list[dict] = []
-    for fname in filenames:
-        data = _load_paper_data(fname)
-        if isinstance(data, str):
-            continue  # skip unreadable papers
-        papers_data.append(data)
-
+    papers_data, skipped = _collect_papers_data(filenames)
     if not papers_data:
-        return _error("No readable papers found.")
+        return _error("No readable papers found.", skipped_papers=skipped)
 
     from services.bibliometric_engine import build_coverage_matrix
     result = build_coverage_matrix(papers_data, axis_x, axis_y)
+    result["axis_x"] = axis_x
+    result["axis_y"] = axis_y
+    result["skipped_papers"] = skipped
     return _json(result)
 
 
@@ -872,30 +1296,36 @@ _VALID_EXPORT_FORMATS = ("docx", "md")
 def export_analysis(
     title: str,
     paper_filename: str,
-    executive_summary: str,
-    study_data_table: list[dict],
-    quality_assessment: list[dict],
-    strengths: list[str],
-    limitations: list[str],
-    relevance: str,
+    executive_summary: str = "",
+    study_data_table: list[dict] | None = None,
+    quality_assessment: list[dict] | None = None,
+    strengths: list[str] | None = None,
+    limitations: list[str] | None = None,
+    relevance: str = "",
     format: str = "docx",
     output_filename: str | None = None,
 ) -> str:
     """Export the analysis of a single paper to a downloadable document.
 
-    The LLM generates all content (summary, evaluation, strengths, etc.)
-    and this tool formats it as a professional document (.docx or .md).
-    The file is saved under the 'exports' subfolder inside PAPERS_DIR.
+    Only ``title`` and ``paper_filename`` are required. Every analytical field
+    (summary, PICOTS table, quality, strengths, limitations, relevance) is
+    optional — pass whatever you have and missing sections are left empty in
+    the output. This tolerance is intentional: small LLMs (e.g. running on
+    LM Studio) sometimes omit a field in their tool call, and a hard schema
+    error would lose the entire export. Fill in the optional fields whenever
+    possible to get a complete document.
 
     Args:
-        title: Report title.
-        paper_filename: Name of the analysed paper.
-        executive_summary: 3-5 sentence summary (generated by the LLM).
-        study_data_table: List of {field, value} with PICOTS data.
-        quality_assessment: List of {criterion, score, comment}.
-        strengths: Strengths identified by the LLM.
-        limitations: Limitations identified by the LLM.
-        relevance: Research relevance text (from the LLM).
+        title: Report title (REQUIRED).
+        paper_filename: Name of the analysed paper (REQUIRED).
+        executive_summary: 3-5 sentence summary (optional, default "").
+        study_data_table: List of {field, value} with PICOTS data
+            (optional, default []).
+        quality_assessment: List of {criterion, score, comment}
+            (optional, default []).
+        strengths: Strengths identified by the LLM (optional, default []).
+        limitations: Limitations identified by the LLM (optional, default []).
+        relevance: Research relevance text (optional, default "").
         format: "docx" or "md" (default: docx).
         output_filename: Custom filename (auto-generated if omitted).
     """
@@ -904,6 +1334,12 @@ def export_analysis(
             f"Invalid format '{format}'.",
             allowed=list(_VALID_EXPORT_FORMATS),
         )
+
+    study_data_table = study_data_table or []
+    quality_assessment = quality_assessment or []
+    strengths = strengths or []
+    limitations = limitations or []
+
     try:
         if format == "md":
             result = export_analysis_md(
@@ -926,14 +1362,14 @@ def export_analysis(
 @mcp.tool()
 def export_review(
     title: str,
-    research_question: str,
-    prisma_flow: dict,
-    evidence_table: list[dict],
-    quality_summary: list[dict],
-    synthesis_narrative: str,
-    gaps_identified: list[dict],
-    conclusions: str,
-    recommendations: list[str],
+    research_question: str = "",
+    prisma_flow: dict | None = None,
+    evidence_table: list[dict] | None = None,
+    quality_summary: list[dict] | None = None,
+    synthesis_narrative: str = "",
+    gaps_identified: list[dict] | None = None,
+    conclusions: str = "",
+    recommendations: list[str] | None = None,
     format: str = "docx",
     output_filename: str | None = None,
 ) -> str:
@@ -943,19 +1379,24 @@ def export_review(
     evidence table, quality assessment, narrative synthesis, research gaps,
     conclusions, and recommendations.
 
-    IMPORTANT: All text content (synthesis, conclusions, etc.) must be
-    generated by the LLM before calling this tool.
+    Only ``title`` is required. Every other field is optional — pass what you
+    have and missing pieces are rendered empty. This forgiving signature is
+    aimed at small LLMs (e.g. LM Studio) that may drop a field when emitting
+    the tool call; the export still succeeds and the LLM can refill later.
 
     Args:
-        title: Review title.
-        research_question: Research question.
-        prisma_flow: {identified, screened, included, excluded_reasons: [str]}.
-        evidence_table: [{paper, disease, technique, outcome, quality_score}].
-        quality_summary: [{paper, score, verdict}].
-        synthesis_narrative: Synthesis text (generated by the LLM).
-        gaps_identified: [{gap, question, justification}].
-        conclusions: Conclusions text (generated by the LLM).
-        recommendations: List of recommendations.
+        title: Review title (REQUIRED).
+        research_question: Research question (optional).
+        prisma_flow: {identified, screened, included, excluded_reasons: [str]}
+            (optional, default {}).
+        evidence_table: [{paper, disease, technique, outcome, quality_score}]
+            (optional, default []).
+        quality_summary: [{paper, score, verdict}] (optional, default []).
+        synthesis_narrative: Synthesis text (optional).
+        gaps_identified: [{gap, question, justification}]
+            (optional, default []).
+        conclusions: Conclusions text (optional).
+        recommendations: List of recommendations (optional, default []).
         format: "docx" or "md".
         output_filename: Custom filename (optional).
     """
@@ -964,6 +1405,13 @@ def export_review(
             f"Invalid format '{format}'.",
             allowed=list(_VALID_EXPORT_FORMATS),
         )
+
+    prisma_flow = prisma_flow or {}
+    evidence_table = evidence_table or []
+    quality_summary = quality_summary or []
+    gaps_identified = gaps_identified or []
+    recommendations = recommendations or []
+
     try:
         if format == "md":
             result = export_review_md(
@@ -986,19 +1434,23 @@ def export_review(
 @mcp.tool()
 def export_comparison(
     title: str,
-    papers: list[str],
-    comparison_data: list[dict],
-    commentary: str,
+    papers: list[str] | None = None,
+    comparison_data: list[dict] | None = None,
+    commentary: str = "",
     format: str = "docx",
     output_filename: str | None = None,
 ) -> str:
     """Export a comparative table between papers with analytical commentary.
 
+    Only ``title`` is required. Other fields are optional and default to empty
+    so the tool call never fails schema validation when a small LLM omits one.
+
     Args:
-        title: Document title.
-        papers: List of compared paper names.
-        comparison_data: [{field, values: {paper: value}, agreement}].
-        commentary: LLM analysis of differences and similarities.
+        title: Document title (REQUIRED).
+        papers: List of compared paper names (optional, default []).
+        comparison_data: [{field, values: {paper: value}, agreement}]
+            (optional, default []).
+        commentary: LLM analysis of differences and similarities (optional).
         format: "docx" or "md".
         output_filename: Custom filename.
     """
@@ -1007,6 +1459,10 @@ def export_comparison(
             f"Invalid format '{format}'.",
             allowed=list(_VALID_EXPORT_FORMATS),
         )
+
+    papers = papers or []
+    comparison_data = comparison_data or []
+
     try:
         if format == "md":
             result = export_comparison_md(
@@ -1018,6 +1474,51 @@ def export_comparison(
             )
     except Exception as exc:
         logger.error("export_comparison failed: %s", exc)
+        return _error(f"Export failed: {exc}")
+    return _json(result)
+
+
+@mcp.tool()
+def export_coverage_matrix(
+    title: str,
+    matrix_data: dict,
+    commentary: str = "",
+    format: str = "md",
+    output_filename: str | None = None,
+) -> str:
+    """Export a coverage matrix (output of ``coverage_matrix``) to a document.
+
+    Pass the JSON returned by the ``coverage_matrix`` tool unchanged in
+    ``matrix_data``. The exporter renders the cell-count table, the densest
+    cell, and the list of empty cells (research gaps).
+
+    Args:
+        title: Document title.
+        matrix_data: The full result of ``coverage_matrix`` (dict with
+            ``x_labels``, ``y_labels``, ``matrix``, ``empty_cells``,
+            ``densest_cell``, ``axis_x``, ``axis_y``).
+        commentary: Optional analytical narrative from the LLM.
+        format: "md" or "docx" (default "md").
+        output_filename: Custom filename (auto-generated if omitted).
+    """
+    if format not in _VALID_EXPORT_FORMATS:
+        return _error(
+            f"Invalid format '{format}'.",
+            allowed=list(_VALID_EXPORT_FORMATS),
+        )
+    if not isinstance(matrix_data, dict):
+        return _error("`matrix_data` must be the dict returned by coverage_matrix.")
+    try:
+        if format == "md":
+            result = export_coverage_matrix_md(
+                title, matrix_data, commentary, output_filename,
+            )
+        else:
+            result = export_coverage_matrix_docx(
+                title, matrix_data, commentary, output_filename,
+            )
+    except Exception as exc:
+        logger.error("export_coverage_matrix failed: %s", exc)
         return _error(f"Export failed: {exc}")
     return _json(result)
 
@@ -1123,16 +1624,26 @@ PASO 2 - ANALIZAR (genera tú el contenido):
 - Evalúa la relevancia para la investigación
 
 PASO 3 - EXPORTAR:
-Llama export_analysis con TODOS los campos requeridos:
-- title: un título descriptivo
-- paper_filename: '{filename}'
-- executive_summary: tu resumen ejecutivo
-- study_data_table: lista de {{field, value}} con datos PICOTS
-- quality_assessment: lista de {{criterion, score, comment}}
-- strengths: lista de fortalezas
-- limitations: lista de limitaciones
-- relevance: texto de relevancia
-- format: '{format}'
+Llama export_analysis. Sólo dos campos son OBLIGATORIOS:
+  - title: un título descriptivo (string)
+  - paper_filename: '{filename}'
+
+Los demás son OPCIONALES — si falta alguno, la sección quedará vacía:
+  - executive_summary (string): resumen ejecutivo
+  - study_data_table (lista de objetos {{"field": str, "value": str}}): PICOTS
+  - quality_assessment (lista de objetos {{"criterion": str, "score": str, "comment": str}})
+  - strengths (lista de strings): fortalezas
+  - limitations (lista de strings): limitaciones
+  - relevance (string): texto de relevancia
+  - format: '{format}'
+
+EJEMPLO de llamada mínima (válida) si el modelo no logra estructurar todo:
+  export_analysis(title="Análisis de X", paper_filename="{filename}")
+
+EJEMPLO de llamada COMPLETA (recomendada) — ten en cuenta que study_data_table
+y quality_assessment son listas de objetos, NO strings:
+  study_data_table=[{{"field": "Disease", "value": "Parkinson"}}, ...]
+  quality_assessment=[{{"criterion": "Sample size", "score": "high", "comment": "n=120"}}, ...]
 
 El documento se guardará automáticamente en la carpeta exports."""
 
@@ -1152,7 +1663,23 @@ def main() -> None:
             "PAPERS_DIR does not exist yet: %s (tools will report this)",
             PAPERS_DIR,
         )
-    mcp.run(transport="stdio")
+    # ``show_banner=False`` keeps STDIO clean for MCP hosts: FastMCP would
+    # otherwise print an ASCII banner to stderr and run a PyPI update check
+    # on every launch (latency + network access for a local-only server).
+    try:
+        mcp.run(transport="stdio", show_banner=False)
+    except KeyboardInterrupt:
+        logger.info("paper-analyzer interrupted")
+    except BaseException:
+        logger.exception("paper-analyzer terminated with an error")
+        raise
+
+    # Under PyInstaller, CPython's final stream flush raises
+    # "ValueError: I/O operation on closed file" because the MCP stdio
+    # transport has already closed the underlying stdout buffer. All
+    # JSON-RPC responses are flushed per message, so skip finalization.
+    logging.shutdown()
+    os._exit(0)
 
 
 if __name__ == "__main__":

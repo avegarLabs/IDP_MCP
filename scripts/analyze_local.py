@@ -84,37 +84,63 @@ async def run(keywords: list[str]) -> None:
             print(f"       {entry['page_count']} pages, {entry['size_kb']} KB")
             print("=" * 78)
 
-            analysis = _unwrap(
+            metadata = _unwrap(
                 await client.call_tool(
-                    "analyze_paper",
-                    {
-                        "filename": filename,
-                        "sections": DEFAULT_SECTIONS,
-                        "focus_keywords": keywords,
-                    },
+                    "get_paper_metadata", {"filename": filename}
                 )
             )
-            # Show a compact view: title + sections + density + short previews.
-            if isinstance(analysis, dict):
+            if isinstance(metadata, dict) and "error" not in metadata:
                 overview = {
-                    "title": analysis.get("title"),
-                    "total_pages": analysis.get("total_pages"),
-                    "estimated_word_count": analysis.get("estimated_word_count"),
-                    "detected_sections": analysis.get("detected_sections"),
-                    "keyword_density": analysis.get("keyword_density"),
+                    key: metadata.get(key)
+                    for key in (
+                        "title",
+                        "authors",
+                        "year",
+                        "doi",
+                        "detected_sections",
+                        "total_pages",
+                        "estimated_word_count",
+                        "references_count",
+                        "detected_language",
+                    )
                 }
-                print("\n-- overview --")
+                print("\n-- metadata --")
                 print(_pretty(overview))
+                abstract = metadata.get("abstract") or ""
+                if abstract:
+                    print("\n-- abstract --")
+                    print(_safe(abstract[:800]))
+            else:
+                print(_pretty(metadata))
 
-                full_text = analysis.get("full_text_by_section", {}) or {}
-                if full_text:
+            sections_payload = _unwrap(
+                await client.call_tool(
+                    "extract_sections",
+                    {"filename": filename, "sections": DEFAULT_SECTIONS},
+                )
+            )
+            if isinstance(sections_payload, dict) and "error" not in sections_payload:
+                if "available" in sections_payload:
+                    print(f"\nNo requested sections detected; available: {sections_payload['available']}")
+                else:
                     print("\n-- section previews (first 400 chars each) --")
-                    for name, body in full_text.items():
+                    for name, body in sections_payload.items():
                         print(f"\n[{name}]")
-                        preview = body[:400] + ("…" if len(body) > 400 else "")
+                        preview = body[:400] + ("..." if len(body) > 400 else "")
                         print(_safe(preview))
             else:
-                print(_pretty(analysis))
+                print(_pretty(sections_payload))
+
+            quality = _unwrap(
+                await client.call_tool("assess_quality", {"filename": filename})
+            )
+            if isinstance(quality, dict) and "error" not in quality:
+                indicators = quality.get("indicators", {})
+                true_count = sum(1 for value in indicators.values() if value is True)
+                print(f"\n-- quality indicators ({true_count} detected) --")
+                print(_pretty(indicators))
+            else:
+                print(_pretty(quality))
 
             # Keyword search (snippets) for context quotes.
             if keywords:

@@ -10,6 +10,7 @@ entire text is returned under a single ``"full_text"`` key.
 
 from __future__ import annotations
 
+import html
 import re
 from typing import Iterable
 
@@ -169,13 +170,52 @@ def detect_section_start(line: str) -> str | None:
     return _ALIAS_TO_CANONICAL.get(cleaned)
 
 
+# Inline header pattern — matches "Abstract: We present...", "Methods—Body...",
+# "Background. Recent advances..." where the header alias is followed by a
+# punctuation separator and at least one whitespace + body text on the same
+# line. Pure space separation is intentionally rejected to avoid matching
+# sentences that happen to start with a section word.
+_INLINE_ALIASES_BY_LEN = "|".join(
+    re.escape(alias)
+    for alias in sorted(_ALIAS_TO_CANONICAL.keys(), key=len, reverse=True)
+)
+_INLINE_HEADER_RE = re.compile(
+    rf"^\s*(?:\d+(?:\.\d+)*\.?\s+|[ivx]+\.\s+)?"
+    rf"({_INLINE_ALIASES_BY_LEN})"
+    rf"\s*[:\.—–‐‒\-\|]\s*(\S.*)$",
+    re.IGNORECASE,
+)
+
+
+def detect_inline_section_start(line: str) -> tuple[str, str] | None:
+    """Detect a header that shares its line with body text.
+
+    Returns ``(canonical_name, body_text)`` when *line* looks like
+    ``"Abstract: We present..."`` (header alias + punctuation separator +
+    content). Returns ``None`` otherwise. Plain header-only lines are handled
+    by :func:`detect_section_start`.
+    """
+    if not line:
+        return None
+    m = _INLINE_HEADER_RE.match(line)
+    if not m:
+        return None
+    alias = m.group(1).strip().lower()
+    canon = _ALIAS_TO_CANONICAL.get(alias)
+    if canon is None:
+        return None
+    return canon, m.group(2).strip()
+
+
 def detect_sections(pages: Iterable[PageText]) -> dict[str, str]:
     """Split the full text of a paper into sections.
 
     Walks every line, switching the active "current section" whenever a line
-    matches a known header. Text before the first detected header is stored
-    under ``"header"``. If no header matches anywhere, returns a single
-    ``{"full_text": ...}`` entry as a safe fallback.
+    matches a known header. Inline headers — where the alias and the section's
+    body share a single line, separated by punctuation (``"Abstract: We..."``)
+    — are also recognised and the body portion is captured. Text before the
+    first detected header is stored under ``"header"``. If no header matches
+    anywhere, returns a single ``{"full_text": ...}`` entry as a safe fallback.
 
     Args:
         pages: Iterable of ``{"page_number", "text"}`` dicts produced by
@@ -203,6 +243,17 @@ def detect_sections(pages: Iterable[PageText]) -> dict[str, str]:
                 # Do not store the header line itself in the body.
                 continue
 
+            inline = detect_inline_section_start(line)
+            if inline is not None:
+                any_header_found = True
+                canon, body = inline
+                current = canon
+                if current not in buckets:
+                    buckets[current] = []
+                if body:
+                    buckets[current].append(body)
+                continue
+
             # Skip lines that are completely empty of non-whitespace characters
             # only if they are leading the prelude (to avoid noisy leading blanks).
             if current is None:
@@ -225,12 +276,14 @@ def detect_sections(pages: Iterable[PageText]) -> dict[str, str]:
     return result
 
 
-# Public heuristics used by analyze_paper ------------------------------------
+# Public heuristics used by title and metadata extraction --------------------
 
 _TITLE_BANNED_PREFIXES = (
     "ieee transactions",
     "ieee access",
     "ieee proceedings",
+    "ieee journal",
+    "ieee/cvf",
     "acm transactions",
     "proceedings of",
     "arxiv:",
@@ -240,9 +293,42 @@ _TITLE_BANNED_PREFIXES = (
     "international conference",
     "©",
     "doi:",
+    "doi ",
     "https://",
     "http://",
     "preprint",
+    # Article-type banners (Frontiers, MDPI, JoVE, …)
+    "type ",
+    "research article",
+    "original research",
+    "original article",
+    "review article",
+    "research report",
+    "video article",
+    "perspective",
+    "open access",
+    "published",
+    "published:",
+    "received ",
+    "received:",
+    "accepted ",
+    "accepted:",
+    "submitted ",
+    "submitted:",
+    "edited by",
+    "reviewed by",
+    "correspondence",
+    "citation",
+    # Institution-only first lines
+    "university of ",
+    "institute of ",
+    "department of ",
+    "school of ",
+    "faculty of ",
+    "college of ",
+    "centre for ",
+    "center for ",
+    "hospital of ",
 )
 
 _TITLE_BANNED_TOKENS = (
@@ -250,33 +336,222 @@ _TITLE_BANNED_TOKENS = (
     "all rights reserved",
     "submitted to",
     "under review",
+    " et al.",
+    " et al ",
+    "open access",  # filters lines like "RESEARCH Open Access"
 )
 
+# Banner patterns that are not safely matched by simple prefixes/tokens.
+_TITLE_BANNED_REGEXES: tuple[re.Pattern[str], ...] = (
+    # Page-number banner: "190 IEEEJOURNAL..." or "1066 IEEEJOURNAL..."
+    re.compile(r"^\d{1,4}\s+[A-Z]{4,}"),
+    # Journal banner with VOL./NO.
+    re.compile(r"\bvol\s*\.\s*\d", re.IGNORECASE),
+    re.compile(r"\bno\s*\.\s*\d", re.IGNORECASE),
+    re.compile(r"\bissn\b|\beissn\b", re.IGNORECASE),
+    # ALLCAPS run-on words (e.g. "RESEARCHARTICLE", "JournalofParkinson…")
+    re.compile(r"^[A-Z]{6,}$"),
+    # Journal citation banner: "Neurol Ther (2024) 13:1287–1301"
+    re.compile(r"\(\d{4}\)\s*\d+\s*[:;]\s*\d"),
+    # Author list: "Wei Tang, Peter Van Ooijen, Deborah Sival, ..." (≥2 commas
+    # AND ≥2 ``Name Name`` patterns).
+    re.compile(
+        r"^[A-Z][a-zA-Zà-ÿ]+\s+[A-Z][a-zA-Zà-ÿ]+,\s*[A-Z][a-zA-Zà-ÿ]+\s+[A-Z][a-zA-Zà-ÿ]+,",
+    ),
+)
 
-def detect_title(pages: list[PageText]) -> str:
-    """Best-effort title heuristic for the first page of a paper.
+# Lowercase tokens that, when they end a title line, suggest the line is
+# wrapped and the next line continues the title.
+_CONTINUATION_TAIL_WORDS: frozenset[str] = frozenset({
+    "of", "and", "with", "for", "to", "in", "on", "at", "as", "or",
+    "via", "using", "the", "a", "an", "from", "by", "into", "through",
+    "between", "across", "&",
+})
 
-    Returns the first line of page 1 that is not a publisher banner, a DOI, a
-    URL, a section header, or a length outlier (10–250 characters).
+
+def _is_title_candidate(line: str) -> bool:
+    """Return True if *line* could plausibly be a paper title."""
+    if not (10 <= len(line) <= 300):
+        return False
+    if " " not in line:  # single concatenated word, junk
+        return False
+    low = line.lower()
+    if any(low.startswith(prefix) for prefix in _TITLE_BANNED_PREFIXES):
+        return False
+    if any(token in low for token in _TITLE_BANNED_TOKENS):
+        return False
+    if any(rx.search(line) for rx in _TITLE_BANNED_REGEXES):
+        return False
+    if detect_section_start(line) is not None:
+        return False
+    if detect_inline_section_start(line) is not None:
+        return False
+    # Reject lines that are mostly non-letters (banner debris, citation strings).
+    letters = sum(1 for c in line if c.isalpha())
+    if letters / len(line) < 0.6:
+        return False
+    return True
+
+
+def _is_plausible_meta_title(candidate: str) -> bool:
+    """Sanity-check a PDF-embedded ``/Info Title``.
+
+    Some PDFs embed an article ID (``"frsip-2022-884384 1..11"``) or a single
+    publisher banner instead of the actual title. Reject when the string is too
+    short, has too few letters relative to its length, or contains no real
+    multi-letter word.
     """
+    if not (10 <= len(candidate) <= 300):
+        return False
+    if " " not in candidate:
+        return False
+    letters = sum(1 for c in candidate if c.isalpha())
+    if letters / len(candidate) < 0.6:
+        return False
+    # Require at least two real words (4+ letters each) to avoid
+    # ``"abc 123"``-style article IDs slipping through.
+    real_words = re.findall(r"[A-Za-zÀ-ÿ]{4,}", candidate)
+    if len(real_words) < 2:
+        return False
+    return True
+
+
+def _is_partial_title(line: str) -> bool:
+    """True when *line* looks like a wrapped (incomplete) title.
+
+    Triggers when the line ends with a punctuation that suggests continuation
+    (hyphen, dash, comma, semicolon, colon), with a hyphenated compound word
+    (``"Attention-based"``), or with a lowercase function word
+    (``"... Analysis of"``).
+    """
+    stripped = line.rstrip()
+    if not stripped:
+        return False
+    if stripped.endswith(("-", "–", "—", ",", ";", ":")):
+        return True
+    last_word_match = re.search(r"(\S+)\s*$", stripped)
+    if not last_word_match:
+        return False
+    last_word = last_word_match.group(1).lower().rstrip(".,;:")
+    if "-" in last_word and not last_word.startswith("-"):
+        return True
+    if last_word in _CONTINUATION_TAIL_WORDS:
+        return True
+    return False
+
+
+def _is_safe_title_continuation(line: str) -> bool:
+    """True when *line* looks safe to append as the second line of a title.
+
+    Rejects author lines, banners, ORCID strings, emails and section headers. The
+    continuation does not need to be a full title candidate by itself (it can be
+    a short fragment like ``"Networks"``).
+    """
+    if not (3 <= len(line) <= 200):
+        return False
+    if detect_section_start(line) is not None:
+        return False
+    if detect_inline_section_start(line) is not None:
+        return False
+    low = line.lower()
+    if any(low.startswith(p) for p in _TITLE_BANNED_PREFIXES):
+        return False
+    if any(rx.search(line) for rx in _TITLE_BANNED_REGEXES):
+        return False
+    if "@" in line:  # email line
+        return False
+    if re.search(r"\d{4}-\d{4}-\d{4}-\d{3}[\dX]", line):  # ORCID
+        return False
+    # Reject author-like patterns: "X Y, Z W" or "X. Y., Z. W."
+    if re.search(r"[A-Z][a-zA-Zà-ÿ]+\s+[A-Z][a-zA-Zà-ÿ]+\s*,", line):
+        return False
+    if re.match(r"^[A-Z]\.[A-Z]?\.?\s+[A-Z]", line):
+        return False
+    if " " not in line and len(line) < 15:
+        return False
+    return True
+
+
+def _looks_like_author_metadata(line: str) -> bool:
+    """True when *line* carries an unambiguous author marker.
+
+    Used as a look-ahead signal: when the line *after* the presumed second title
+    line contains ORCIDs or emails, the first two lines are a wrapped title even
+    if the first one ends with an innocuous word (``"... of the Upper"``
+    followed by ``"Limbs in ..."``).
+
+    Deliberately conservative: a plain ``"Name, Name, Name"`` line also occurs
+    in titles, so comma counting is not used here.
+    """
+    if not line:
+        return False
+    return bool(re.search(r"\d{4}-\d{4}-\d{4}-\d{3}[\dX]", line)) or "@" in line
+
+
+def _title_wraps_before_authors(lines: list[str], index: int) -> bool:
+    """True when ``lines[index:index+2]`` look like a wrapped title."""
+    if index + 2 >= len(lines):
+        return False
+    continuation = lines[index + 1].strip()
+    following = lines[index + 2].strip()
+    return (
+        bool(continuation)
+        and _is_safe_title_continuation(continuation)
+        and _looks_like_author_metadata(following)
+    )
+
+
+def detect_title(
+    pages: list[PageText],
+    pdf_meta_title: str | None = None,
+) -> str:
+    """Best-effort title detection for a paper.
+
+    Order of preference:
+        1. The PDF's embedded ``/Info`` ``Title`` field, if present and
+           plausibly a title (length and contains a space).
+        2. The first plausible line on page 1 that survives the banner filters
+           in :data:`_TITLE_BANNED_PREFIXES`, :data:`_TITLE_BANNED_TOKENS` and
+           :data:`_TITLE_BANNED_REGEXES`. If that line ends in a continuation
+           marker (per :func:`_is_partial_title`) and the next line passes
+           :func:`_is_safe_title_continuation`, both are joined.
+        3. ``"Unknown"`` if nothing plausible was found.
+
+    Args:
+        pages: First-page-onwards text from :func:`extract_full_text`.
+        pdf_meta_title: Optional title pulled from the PDF metadata
+            (``pdfplumber.PDF.metadata['Title']``). Cleaned via
+            :func:`services.pdf_extractor._clean_text` upstream.
+    """
+    if pdf_meta_title:
+        # Some publishers HTML-encode the embedded title (``&#x0027;`` → ``'``,
+        # ``&#x2014;`` → em-dash). Decode before validating so the cleaned
+        # form is what we evaluate and return.
+        candidate = html.unescape(pdf_meta_title).strip().strip('"').strip("'")
+        if _is_plausible_meta_title(candidate):
+            return candidate
+
     if not pages:
         return "Unknown"
 
     first_text = pages[0].get("text") or ""
+    raw_lines = first_text.split("\n")
 
-    for raw_line in first_text.split("\n"):
+    for i, raw_line in enumerate(raw_lines[:40]):
         line = raw_line.strip()
-        if not (10 <= len(line) <= 250):
+        if not _is_title_candidate(line):
             continue
-        low = line.lower()
-        if any(low.startswith(prefix) for prefix in _TITLE_BANNED_PREFIXES):
-            continue
-        if any(token in low for token in _TITLE_BANNED_TOKENS):
-            continue
-        # Skip lines that are themselves section headers (e.g. "ABSTRACT").
-        if detect_section_start(line) is not None:
-            continue
-        return line
+        joined = line
+        if _is_partial_title(line) or _title_wraps_before_authors(raw_lines, i):
+            if i + 1 < len(raw_lines):
+                nxt = raw_lines[i + 1].strip()
+                if (
+                    nxt
+                    and _is_safe_title_continuation(nxt)
+                    and len(joined) + 1 + len(nxt) <= 300
+                ):
+                    joined = f"{joined} {nxt}"
+        return joined
 
     return "Unknown"
 

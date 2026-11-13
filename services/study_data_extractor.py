@@ -79,17 +79,25 @@ def _find_first(patterns: list[str], text: str) -> str | None:
     for pat in patterns:
         match = re.search(pat, text)
         if match:
-            return match.group(0).strip()
+            return re.sub(r"\s+", " ", match.group(0)).strip()
     return None
 
 
 def _find_all_unique(patterns: list[str], text: str) -> list[str]:
-    """Return all unique matches (case-preserved) across all patterns."""
-    found: set[str] = set()
+    """Return unique matches, case-insensitively, with whitespace collapsed.
+
+    PDF extraction breaks hyphenated/compound terms across lines
+    (``"Leap\\nMotion"``) and the same tool may appear as ``"Deep Learning"``
+    and ``"Deep learning"``. Without normalisation each variant would become a
+    separate label — and therefore a separate column in the coverage matrix.
+    """
+    found: dict[str, str] = {}
     for pat in patterns:
         for match in re.finditer(pat, text):
-            found.add(match.group(0).strip())
-    return sorted(found)
+            value = re.sub(r"\s+", " ", match.group(0)).strip()
+            if value:
+                found.setdefault(value.lower(), value)
+    return sorted(found.values(), key=str.lower)
 
 
 def _find_sample_size(patterns: list[str], text: str) -> int | None:
@@ -121,17 +129,24 @@ def _find_metric_values(text: str) -> list[dict[str, str]]:
     return results[:10]
 
 
+_ENV_PATTERNS: tuple[tuple[str, str], ...] = (
+    ("laboratory", r"\b(laboratory|laboratories|lab\s+setting)\b"),
+    ("clinical", r"\b(clinic|clinics|clinical|hospital|hospitals|outpatient)\b"),
+    ("home", r"\b(at\s+home|home\s+(?:setting|environment|video|recording)|domicil\w*|remote\s+(?:setting|monitoring))\b"),
+    ("telemedicine", r"\b(telemedicine|telehealth|telerehabilitation)\b"),
+)
+
+
 def _detect_environment(text: str) -> str | None:
-    """Simple heuristic for study environment."""
+    """Heuristic for study environment using word-bounded matches.
+
+    Avoids the prior false positives where ``"home"`` matched ``"homeostasis"``
+    and ``"lab"`` matched ``"label"``/``"labeling"``.
+    """
     low = text.lower()
-    if "laborator" in low or "lab setting" in low:
-        return "laboratory"
-    if "clinic" in low or "hospital" in low:
-        return "clinical"
-    if "home" in low or "domicil" in low or "remote" in low:
-        return "home"
-    if "telemedicine" in low or "telehealth" in low:
-        return "telemedicine"
+    for label, pattern in _ENV_PATTERNS:
+        if re.search(pattern, low):
+            return label
     return None
 
 

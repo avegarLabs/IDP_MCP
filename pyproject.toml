@@ -1,16 +1,20 @@
 [project]
 name = "paper-analyzer-mcp"
 version = "2.0.0"
-description = "MCP server for systematic review of research papers (PDF). 13 tools + 3 prompts covering the full PRISMA pipeline via FastMCP + pdfplumber."
+description = "MCP server for systematic review of research papers (PDF). 18 tools + 4 prompts covering the full PRISMA pipeline via FastMCP + pdfplumber."
 readme = "README.md"
 requires-python = ">=3.12"
 authors = [
     { name = "Alfredo" },
 ]
 dependencies = [
-    "fastmcp>=2.0,<4.0",
+    "fastmcp>=3.0,<4.0",
+    "onnxruntime>=1.20,<2",
+    "opencv-python>=4.10,<5",
     "pdfplumber>=0.11",
+    "pypdfium2>=4.30",
     "python-docx>=1.2.0",
+    "rapidocr==3.4.5",
 ]
 
 [project.optional-dependencies]
@@ -23,6 +27,7 @@ export = [
 
 [dependency-groups]
 dev = [
+    "pyinstaller",
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
     "reportlab>=4.0",

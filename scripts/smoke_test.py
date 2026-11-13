@@ -1,7 +1,7 @@
 """Non-interactive smoke test for paper-analyzer-mcp v2.
 
 Creates two synthetic PDFs in a temp directory, launches the MCP server, and
-invokes all 13 tools + verifies 3 prompts are registered.
+invokes all 18 tools + verifies 4 prompts are registered.
 
 Run with::
 
@@ -36,6 +36,7 @@ EXPECTED_TOOLS = {
     "search_keywords",
     "assess_quality",
     "get_quality_checklist",
+    "get_ocr_status",
     "compare_papers",
     "synthesis_matrix",
     "keyword_cooccurrence",
@@ -43,6 +44,7 @@ EXPECTED_TOOLS = {
     "export_analysis",
     "export_review",
     "export_comparison",
+    "export_coverage_matrix",
 }
 
 EXPECTED_PROMPTS = {"deep_analysis", "systematic_review", "gap_analysis", "analyze_and_export"}
@@ -148,6 +150,7 @@ async def run(papers_dir: Path) -> int:
 
     env = dict(os.environ)
     env["PAPERS_DIR"] = str(papers_dir)
+    env["EXPORTS_DIR"] = str(papers_dir.parent / "exports")
     transport = PythonStdioTransport(script_path=str(SERVER), env=env)
 
     async with Client(transport) as client:
@@ -156,7 +159,9 @@ async def run(papers_dir: Path) -> int:
         tool_names = {t.name for t in tools}
         print(f"Tools exposed ({len(tool_names)}): {sorted(tool_names)}")
         missing_tools = EXPECTED_TOOLS - tool_names
+        extra_tools = tool_names - EXPECTED_TOOLS
         assert not missing_tools, f"Missing tools: {missing_tools}"
+        assert not extra_tools, f"Unexpected tools: {extra_tools}"
         # Verify analyze_paper is removed
         assert "analyze_paper" not in tool_names, "analyze_paper should have been removed!"
 
@@ -165,7 +170,9 @@ async def run(papers_dir: Path) -> int:
         prompt_names = {p.name for p in prompts}
         print(f"Prompts exposed ({len(prompt_names)}): {sorted(prompt_names)}")
         missing_prompts = EXPECTED_PROMPTS - prompt_names
+        extra_prompts = prompt_names - EXPECTED_PROMPTS
         assert not missing_prompts, f"Missing prompts: {missing_prompts}"
+        assert not extra_prompts, f"Unexpected prompts: {extra_prompts}"
 
         # --- Tool tests ---
 
@@ -243,7 +250,14 @@ async def run(papers_dir: Path) -> int:
             ),
         )
 
-        # 10. compare_papers
+        # 10. get_ocr_status
+        ocr = await client.call_tool("get_ocr_status", {})
+        _dump("get_ocr_status", ocr)
+        ocr_payload = json.loads(ocr.content[0].text)
+        for key in ("enabled", "available", "settings"):
+            assert key in ocr_payload, f"get_ocr_status missing '{key}'"
+
+        # 11. compare_papers
         _dump(
             "compare_papers([alpha.pdf, beta.pdf])",
             await client.call_tool(
@@ -252,7 +266,7 @@ async def run(papers_dir: Path) -> int:
             ),
         )
 
-        # 11. synthesis_matrix
+        # 12. synthesis_matrix
         _dump(
             "synthesis_matrix(evidence)",
             await client.call_tool(
@@ -264,7 +278,7 @@ async def run(papers_dir: Path) -> int:
             ),
         )
 
-        # 12. keyword_cooccurrence
+        # 13. keyword_cooccurrence
         _dump(
             "keyword_cooccurrence([alpha, beta], [ataxia, Parkinson, MediaPipe])",
             await client.call_tool(
@@ -276,7 +290,7 @@ async def run(papers_dir: Path) -> int:
             ),
         )
 
-        # 13. coverage_matrix
+        # 14. coverage_matrix
         _dump(
             "coverage_matrix([alpha, beta])",
             await client.call_tool(
@@ -289,7 +303,7 @@ async def run(papers_dir: Path) -> int:
             ),
         )
 
-        # 14. export_analysis (Markdown)
+        # 15. export_analysis (Markdown)
         _dump(
             "export_analysis(md)",
             await client.call_tool(
@@ -315,7 +329,7 @@ async def run(papers_dir: Path) -> int:
             ),
         )
 
-        # 15. export_review (Markdown)
+        # 16. export_review (Markdown)
         _dump(
             "export_review(md)",
             await client.call_tool(
@@ -348,7 +362,7 @@ async def run(papers_dir: Path) -> int:
             ),
         )
 
-        # 16. export_comparison (Markdown)
+        # 17. export_comparison (Markdown)
         _dump(
             "export_comparison(md)",
             await client.call_tool(
@@ -367,8 +381,30 @@ async def run(papers_dir: Path) -> int:
             ),
         )
 
+        # 18. export_coverage_matrix (Markdown)
+        coverage = await client.call_tool(
+            "coverage_matrix",
+            {
+                "filenames": ["alpha.pdf", "beta.pdf"],
+                "axis_x": "cv_tool",
+                "axis_y": "disease",
+            },
+        )
+        _dump(
+            "export_coverage_matrix(md)",
+            await client.call_tool(
+                "export_coverage_matrix",
+                {
+                    "title": "Coverage: tools vs diseases",
+                    "matrix_data": json.loads(coverage.content[0].text),
+                    "commentary": "MediaPipe covers ataxia; OpenPose covers Parkinson's.",
+                    "format": "md",
+                },
+            ),
+        )
+
     print(f"\n{'='*60}")
-    print(f"OK — all {len(EXPECTED_TOOLS)} tools + {len(EXPECTED_PROMPTS)} prompts verified.")
+    print(f"OK - all {len(EXPECTED_TOOLS)} tools + {len(EXPECTED_PROMPTS)} prompts verified.")
     return 0
 
 

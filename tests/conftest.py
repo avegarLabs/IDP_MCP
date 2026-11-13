@@ -31,6 +31,54 @@ def _make_pdf(path: Path, pages: list[list[str]]) -> None:
     c.save()
 
 
+def _make_scanned_pdf(path: Path, lines: list[str]) -> None:
+    """Create a PDF whose only content is a rendered bitmap (no text layer).
+
+    ReportLab writes a text PDF, pdfium renders it at ~300 DPI, and the bitmap
+    is embedded into a new PDF. The result is image-only, like a scanner output.
+    """
+    import pypdfium2 as pdfium
+    from PIL import Image
+    from reportlab.lib.utils import ImageReader
+
+    source = path.with_name(path.stem + "_source.pdf")
+    c = canvas.Canvas(str(source), pagesize=letter)
+    y = 720
+    for line in lines:
+        c.setFont("Helvetica", 20)
+        c.drawString(72, y, line)
+        y -= 42
+    c.showPage()
+    c.save()
+
+    document = pdfium.PdfDocument(str(source))
+    try:
+        rendered = document[0].render(scale=4).to_pil()
+    finally:
+        document.close()
+    source.unlink(missing_ok=True)
+
+    if rendered.mode in ("RGBA", "LA"):
+        background = Image.new("RGB", rendered.size, "white")
+        background.paste(rendered, mask=rendered.split()[-1])
+        rendered = background
+    else:
+        rendered = rendered.convert("RGB")
+
+    page_width = rendered.width * 72 / 300
+    page_height = rendered.height * 72 / 300
+    output = canvas.Canvas(str(path), pagesize=(page_width, page_height))
+    output.drawImage(
+        ImageReader(rendered),
+        0,
+        0,
+        width=page_width,
+        height=page_height,
+    )
+    output.showPage()
+    output.save()
+
+
 # ---- Paper contents shared across tests ------------------------------------
 
 STANDARD_PAPER_PAGES: list[list[str]] = [
@@ -94,6 +142,16 @@ SPANISH_PAPER_PAGES: list[list[str]] = [
     ],
 ]
 
+# Image-only page used by the OCR tests. The text is rendered to a bitmap and
+# embedded in a PDF without a text layer, exactly like a scanned document.
+SCANNED_PAPER_LINES: list[str] = [
+    "Scanned Paper About Ataxia",
+    "Abstract",
+    "La ataxia afecta la coordinación motora.",
+    "We used MediaPipe and computer vision.",
+    "Results: 92% accuracy.",
+]
+
 
 # ---- Fixtures --------------------------------------------------------------
 
@@ -116,6 +174,13 @@ def headerless_pdf(tmp_path: Path) -> Path:
 def spanish_pdf(tmp_path: Path) -> Path:
     pdf = tmp_path / "es_paper.pdf"
     _make_pdf(pdf, SPANISH_PAPER_PAGES)
+    return pdf
+
+
+@pytest.fixture
+def scanned_pdf(tmp_path: Path) -> Path:
+    pdf = tmp_path / "scanned_paper.pdf"
+    _make_scanned_pdf(pdf, SCANNED_PAPER_LINES)
     return pdf
 
 

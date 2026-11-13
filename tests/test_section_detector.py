@@ -203,3 +203,22 @@ def test_detect_title_empty_pages_returns_unknown() -> None:
 def test_detect_title_returns_unknown_when_no_candidates() -> None:
     pages = [{"page_number": 1, "text": "short\nDOI: 10.1/abc\n© 2026"}]
     assert detect_title(pages) == "Unknown"
+
+
+def test_detect_title_joins_wrapped_title_before_orcid_authors() -> None:
+    pages = [
+        {
+            "page_number": 1,
+            "text": (
+                "Key Trends in Quantifying Motor Signs of the Upper\n"
+                "Limbs in Neurodegenerative Diseases\n"
+                "Alfredo Vega Ramírez1[0009-0005-3339-6691], "
+                "Luis Velázquez Pérez2,3[0000-0003-1628-2703]\n"
+                "Abstract. Body text follows."
+            ),
+        }
+    ]
+    assert detect_title(pages) == (
+        "Key Trends in Quantifying Motor Signs of the Upper "
+        "Limbs in Neurodegenerative Diseases"
+    )

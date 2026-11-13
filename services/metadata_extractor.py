@@ -13,12 +13,20 @@ from services.pdf_extractor import PageText
 from services.section_detector import detect_section_start, detect_sections, detect_title
 
 
-def extract_metadata(pages: list[PageText], filename: str) -> dict:
+def extract_metadata(
+    pages: list[PageText],
+    filename: str,
+    pdf_meta: dict | None = None,
+) -> dict:
     """Extract structured bibliographic metadata from paper pages.
 
     Args:
         pages: Page dicts from :func:`services.pdf_extractor.extract_full_text`.
         filename: Original PDF filename (used as year fallback).
+        pdf_meta: Optional ``/Info`` dictionary from
+            :func:`services.pdf_extractor.extract_pdf_metadata`. Used to recover
+            the canonical title and DOI when the PDF embeds them, since
+            extracted-text heuristics often pick up publisher banners instead.
 
     Returns:
         Dict with title, authors, year, doi, journal, keywords, abstract,
@@ -33,8 +41,11 @@ def extract_metadata(pages: list[PageText], filename: str) -> dict:
     ref_text = sections.get("references", "")
     ref_count = _count_references(ref_text) if ref_text else 0
 
+    pdf_meta = pdf_meta or {}
+    pdf_title = pdf_meta.get("Title") if isinstance(pdf_meta.get("Title"), str) else None
+
     return {
-        "title": detect_title(pages),
+        "title": detect_title(pages, pdf_meta_title=pdf_title),
         "authors": _detect_authors(first_page),
         "year": _detect_year(first_page, filename),
         "doi": _detect_doi(all_text),

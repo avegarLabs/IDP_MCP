@@ -1,6 +1,6 @@
 """Manual MCP test client for paper-analyzer-mcp.
 
-Spawns ``paper_analyzer.py`` over STDIO and exercises each of the four tools.
+Spawns ``paper_analyzer.py`` over STDIO and exercises the main tools.
 Lets you pick a paper and keywords interactively.
 
 Usage::
@@ -75,8 +75,8 @@ async def run(papers_dir: Path) -> None:
         if not filename:
             return
 
-        # `sections` is now REQUIRED for extract_sections, search_keywords and
-        # analyze_paper. Ask once and reuse for all three calls.
+        # `sections` is REQUIRED for extract_sections and search_keywords.
+        # Ask once and reuse for both calls.
         default_sections = (
             "abstract,introduction,methodology,results,conclusions"
         )
@@ -121,19 +121,21 @@ async def run(papers_dir: Path) -> None:
             )
         )
 
-        # --- 4) analyze_paper ----------------------------------------------
+        # --- 4) get_paper_metadata + assess_quality -------------------------
         print("\n" + "=" * 60)
-        print("4) analyze_paper()")
+        print("4) get_paper_metadata()")
         print("=" * 60)
         _pretty(
             await client.call_tool(
-                "analyze_paper",
-                {
-                    "filename": filename,
-                    "sections": sections,
-                    "focus_keywords": keywords,
-                },
+                "get_paper_metadata", {"filename": filename}
             )
+        )
+
+        print("\n" + "=" * 60)
+        print("5) assess_quality()")
+        print("=" * 60)
+        _pretty(
+            await client.call_tool("assess_quality", {"filename": filename})
         )
 
 

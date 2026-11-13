@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -21,6 +22,18 @@ def tool_module(monkeypatch: pytest.MonkeyPatch, papers_tmp_dir: Path):
 
     module = importlib.reload(paper_analyzer)
     return module
+
+
+@pytest.fixture
+def scanned_tool_module(
+    monkeypatch: pytest.MonkeyPatch, papers_tmp_dir: Path, scanned_pdf: Path
+):
+    """Reload ``paper_analyzer`` with a scanned PDF inside the papers dir."""
+    shutil.copy2(scanned_pdf, papers_tmp_dir / "scanned.pdf")
+    monkeypatch.setenv("PAPERS_DIR", str(papers_tmp_dir))
+    import paper_analyzer
+
+    return importlib.reload(paper_analyzer)
 
 
 def test_list_papers_happy_path(tool_module) -> None:
@@ -213,3 +226,84 @@ def test_screen_paper_returns_summary(tool_module) -> None:
     summary = payload["screening_summary"]
     assert summary["criteria_met_count"] == 2
     assert summary["has_exclusions"] is False
+
+
+def test_disk_cache_failure_is_non_fatal(tool_module, monkeypatch) -> None:
+    """A read-only PAPERS_DIR must not break cross-paper analysis."""
+
+    def _read_only() -> Path:
+        raise OSError("read-only media")
+
+    monkeypatch.setattr(tool_module, "_cache_dir", _read_only)
+    result = tool_module._load_paper_data("alpha.pdf")
+    assert isinstance(result, dict)
+    assert result["filename"] == "alpha.pdf"
+    assert "study_data" in result
+
+
+def test_get_ocr_status_reports_engine(tool_module) -> None:
+    payload = json.loads(tool_module.get_ocr_status())
+    assert payload["engine"] == "rapidocr"
+    assert payload["enabled"] is True
+    assert payload["languages"] == ["latin"]
+    assert "available" in payload
+    assert payload["settings"]["lang"] == "latin"
+
+
+def test_get_paper_metadata_reports_no_ocr_for_digital_pdf(tool_module) -> None:
+    payload = json.loads(tool_module.get_paper_metadata("alpha.pdf"))
+    assert payload["ocr_used"] is False
+    assert payload["ocr_pages"] == []
+
+
+def test_scanned_pdf_metadata_uses_ocr(
+    scanned_tool_module, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from services import ocr_extractor
+
+    def fake_ocr(image, options):  # noqa: ANN001 - test double
+        return (
+            "Scanned Ataxia Paper\n"
+            "John Doe\n"
+            "Abstract\n"
+            "La ataxia afecta la coordinación motora.\n"
+            "We used MediaPipe and computer vision."
+        )
+
+    monkeypatch.setattr(ocr_extractor, "ocr_page", fake_ocr)
+
+    payload = json.loads(scanned_tool_module.get_paper_metadata("scanned.pdf"))
+
+    assert payload["ocr_used"] is True
+    assert payload["ocr_pages"] == [1]
+    assert "ataxia" in json.dumps(payload, ensure_ascii=False).lower()
+
+
+def test_no_text_warning_explains_disabled_ocr(
+    scanned_tool_module, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OCR_ENABLED", "0")
+    module = importlib.reload(scanned_tool_module)
+
+    payload = json.loads(module.get_paper_metadata("scanned.pdf"))
+
+    assert payload["warning"].startswith("No text extracted")
+    assert payload["ocr"]["enabled"] is False
+    assert "hint" in payload
+
+
+def test_pages_cache_avoids_repeated_extraction(tool_module, monkeypatch) -> None:
+    calls: list[int] = []
+    real_extract = tool_module.extract_full_text
+
+    def counting_extract(*args, **kwargs):  # noqa: ANN002, ANN003 - test double
+        calls.append(1)
+        return real_extract(*args, **kwargs)
+
+    monkeypatch.setattr(tool_module, "extract_full_text", counting_extract)
+
+    first = tool_module._load_pages("alpha.pdf")
+    second = tool_module._load_pages("alpha.pdf")
+
+    assert first == second
+    assert len(calls) == 1
