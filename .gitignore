@@ -28,6 +28,7 @@ htmlcov/
 
 # Markdown files — generated docs, guides, exports
 *.md
+!/README.md
 
 # Docs folder — specifications and guides
 docs/
